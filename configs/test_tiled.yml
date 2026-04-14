@@ -5,6 +5,7 @@ test_setup:
   scale: 4             # SR 배율 (MASA 학습 기준 1:4)
   blending: "gaussian" # 블렌딩 방식: "gaussian" | "linear"
   device: "cpu"        # 내장 GPU / CPU 테스트: "cpu" | "cuda"
+  tile_batch_size: 4   # 한 번에 GPU에 올릴 타일 수 (VRAM에 맞게 조절)
 
 paths:
   lr_dir: "./test/input"

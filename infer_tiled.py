@@ -5,24 +5,22 @@ MASA-SR Tiled Inference Engine
 Overlapping tiled super-resolution for high-resolution / low-VRAM environments.
 
 Usage:
-    python infer_tiled.py [--config config.yml]
+    python infer_tiled.py [--config configs/test_tiled.yml]
 
 Pipeline:
-    1. Load config.yml
+    1. Load YAML config
     2. Build MASA model and load checkpoint
     3. For each LR/Ref pair in test/input & test/ref:
         a. Resize Ref to LR*scale (guarantees 1:4 ratio)
-        b. Split LR into overlapping tiles
-        c. Extract corresponding Ref/Ref_down tiles
-        d. Run MASA inference per tile
-        e. Blend tiles with Gaussian or Linear weights
+        b. Pre-extract all overlapping tiles (padded to tile_size)
+        c. Run batched inference (tile_batch_size tiles per forward pass)
+        d. Blend SR tiles back with Gaussian or Linear weights
         f. Save result
 """
 
 import os
 import sys
 import gc
-import math
 import argparse
 import logging
 import numpy as np
@@ -61,23 +59,19 @@ def _linear_kernel(size: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Padding helper
+# Padding helpers
 # ---------------------------------------------------------------------------
 
-def _pad_to_multiple(tensor: torch.Tensor, multiple: int = 32):
-    """Reflect-pad H and W to the next multiple of `multiple`.
-
-    Returns:
-        padded tensor, original H, original W
+def _pad_to_size(tensor: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Replicate-pad tensor to exactly (target_h, target_w).
+    Used to make border tiles the same shape as interior tiles for batching.
     """
     _, _, h, w = tensor.shape
-    h_new = math.ceil(h / multiple) * multiple
-    w_new = math.ceil(w / multiple) * multiple
-    pad_b = h_new - h
-    pad_r = w_new - w
+    pad_b = target_h - h
+    pad_r = target_w - w
     if pad_b > 0 or pad_r > 0:
         tensor = F.pad(tensor, (0, pad_r, 0, pad_b), mode='replicate')
-    return tensor, h, w
+    return tensor
 
 
 # ---------------------------------------------------------------------------
@@ -95,41 +89,49 @@ def run_tiled_inference(
     scale: int,
     blending: str,
     device: torch.device,
+    tile_batch_size: int = 1,
 ) -> torch.Tensor:
-    """Overlapping tiled SR inference.
+    """Overlapping tiled SR inference with GPU-efficient batching.
+
+    All tiles are pre-extracted and padded to a uniform shape (tile_size),
+    then processed in mini-batches of `tile_batch_size` in a single forward
+    pass each — maximising GPU utilisation while keeping peak VRAM bounded.
 
     Args:
-        net           : MASA model (eval mode).
-        lr_tensor     : (1, C, H, W)  – LR image on CPU.
-        ref_tensor    : (1, C, H*scale, W*scale) – Ref already scaled to 4x LR.
-        ref_down_tensor: (1, C, H, W) – Ref downsampled back to LR resolution.
-        tile_size     : Tile edge length in LR pixels.
-        overlap       : Overlap between adjacent tiles in LR pixels.
-        scale         : SR upscaling factor.
-        blending      : "gaussian" | "linear".
-        device        : Target compute device.
+        net             : MASA model (eval mode).
+        lr_tensor       : (1, C, H, W)            LR image on CPU.
+        ref_tensor      : (1, C, H*scale, W*scale) Ref pre-scaled to 4x LR.
+        ref_down_tensor : (1, C, H, W)            Ref downsampled to LR size.
+        tile_size       : Tile edge in LR pixels (must be a multiple of 32).
+        overlap         : Overlap between adjacent tiles in LR pixels.
+        scale           : SR upscale factor.
+        blending        : 'gaussian' | 'linear'.
+        device          : Target compute device.
+        tile_batch_size : Number of tiles per forward pass.
 
     Returns:
         (1, C, H*scale, W*scale) SR tensor on CPU, values in [0, 1].
     """
-    _, C, H, W = lr_tensor.shape
+    if tile_size % 32 != 0:
+        raise ValueError(f"tile_size ({tile_size}) must be a multiple of 32.")
     stride = tile_size - overlap
     if stride <= 0:
-        raise ValueError(f"overlap ({overlap}) must be smaller than tile_size ({tile_size})")
+        raise ValueError(f"overlap ({overlap}) must be smaller than tile_size ({tile_size}).")
 
+    _, C, H, W = lr_tensor.shape
     out_H, out_W = H * scale, W * scale
+    tile_out = tile_size * scale
+
     output_sum = torch.zeros(1, C, out_H, out_W, dtype=torch.float32)
     weight_sum  = torch.zeros(1, 1, out_H, out_W, dtype=torch.float32)
 
-    # Pre-compute blending kernel for a full-size tile
-    tile_out = tile_size * scale
-    if blending == 'gaussian':
-        kernel_np = _gaussian_kernel(tile_out)
-    else:
-        kernel_np = _linear_kernel(tile_out)
+    # Blending kernel for a full-size (interior) tile
+    kernel_np = _gaussian_kernel(tile_out) if blending == 'gaussian' else _linear_kernel(tile_out)
 
-    # Build tile start positions (ensure the last tile covers the image edge)
-    def _tile_starts(length, ts, st):
+    # -------------------------------------------------------------------------
+    # Step 1: Compute tile grid positions
+    # -------------------------------------------------------------------------
+    def _tile_starts(length: int, ts: int, st: int):
         starts = list(range(0, length - ts, st))
         last = max(0, length - ts)
         if not starts or starts[-1] != last:
@@ -138,62 +140,83 @@ def run_tiled_inference(
 
     y_starts = _tile_starts(H, tile_size, stride)
     x_starts = _tile_starts(W, tile_size, stride)
-    total = len(y_starts) * len(x_starts)
-    done  = 0
 
+    # -------------------------------------------------------------------------
+    # Step 2: Pre-extract all tiles, pad to uniform tile_size
+    # -------------------------------------------------------------------------
+    # Each entry: padded tiles (1, C, tile_size, tile_size) and metadata
+    tiles = []
     for y in y_starts:
-        y_end    = min(y + tile_size, H)
-        th_lr    = y_end - y          # actual LR tile height (may be < tile_size at border)
-
+        y_end = min(y + tile_size, H)
+        th = y_end - y          # actual LR tile height (<= tile_size at borders)
         for x in x_starts:
-            x_end    = min(x + tile_size, W)
-            tw_lr    = x_end - x      # actual LR tile width
+            x_end = min(x + tile_size, W)
+            tw = x_end - x      # actual LR tile width
 
-            # ---- Extract tiles (CPU) ----
-            lr_tile       = lr_tensor      [:, :,  y:y_end,          x:x_end          ]
-            ref_tile      = ref_tensor     [:, :,  y*scale:y_end*scale,  x*scale:x_end*scale  ]
-            ref_down_tile = ref_down_tensor[:, :,  y:y_end,          x:x_end          ]
+            # Extract (may be smaller than tile_size at image borders)
+            lr_t  = lr_tensor      [:, :, y:y_end,          x:x_end         ]
+            ref_t = ref_tensor     [:, :, y*scale:y_end*scale, x*scale:x_end*scale]
+            rdn_t = ref_down_tensor[:, :, y:y_end,          x:x_end         ]
 
-            # ---- Pad tiles to 32-multiple (model requirement) ----
-            lr_tile_pad,       _, _  = _pad_to_multiple(lr_tile,       32)
-            ref_tile_pad,      _, _  = _pad_to_multiple(ref_tile,      32)
-            ref_down_tile_pad, _, _  = _pad_to_multiple(ref_down_tile, 32)
+            # Pad border tiles to tile_size so every tile in a batch is the same shape
+            lr_t  = _pad_to_size(lr_t,  tile_size,       tile_size      )
+            ref_t = _pad_to_size(ref_t, tile_size*scale, tile_size*scale)
+            rdn_t = _pad_to_size(rdn_t, tile_size,       tile_size      )
 
-            # ---- Inference ----
-            out_tile = net(
-                lr_tile_pad.to(device),
-                ref_tile_pad.to(device),
-                ref_down_tile_pad.to(device),
-            ).cpu()
+            tiles.append({
+                'lr':  lr_t,   # (1, C, tile_size, tile_size)
+                'ref': ref_t,  # (1, C, tile_size*scale, tile_size*scale)
+                'rdn': rdn_t,  # (1, C, tile_size, tile_size)
+                'th': th, 'tw': tw,
+                'oy': y * scale, 'ox': x * scale,
+            })
 
-            # ---- Remove padding from SR output ----
-            out_tile = out_tile[:, :, :th_lr * scale, :tw_lr * scale]
+    total = len(tiles)
+    logging.info(f'  Total tiles: {total}  (batch_size={tile_batch_size})')
 
-            # ---- Blending kernel (cropped at border tiles) ----
-            kh = th_lr * scale
-            kw = tw_lr * scale
-            if kh == tile_out and kw == tile_out:
-                k = torch.from_numpy(kernel_np).unsqueeze(0).unsqueeze(0)
-            else:
-                k = torch.from_numpy(kernel_np[:kh, :kw]).unsqueeze(0).unsqueeze(0)
+    # -------------------------------------------------------------------------
+    # Step 3: Process tiles in mini-batches
+    # -------------------------------------------------------------------------
+    for batch_start in range(0, total, tile_batch_size):
+        batch = tiles[batch_start: batch_start + tile_batch_size]
+        B = len(batch)
 
-            # ---- Accumulate ----
-            oy, ox   = y * scale, x * scale
-            oy_end   = oy + kh
-            ox_end   = ox + kw
-            output_sum[:, :, oy:oy_end, ox:ox_end] += out_tile * k
-            weight_sum[:, :, oy:oy_end, ox:ox_end] += k
+        # Stack into (B, C, tile_size, tile_size) — move to device
+        lr_batch  = torch.cat([t['lr']  for t in batch], dim=0).to(device)
+        ref_batch = torch.cat([t['ref'] for t in batch], dim=0).to(device)
+        rdn_batch = torch.cat([t['rdn'] for t in batch], dim=0).to(device)
 
-            # ---- Memory cleanup ----
-            del lr_tile_pad, ref_tile_pad, ref_down_tile_pad, out_tile, k
-            gc.collect()
+        # Single forward pass over B tiles simultaneously
+        out_batch = net(lr_batch, ref_batch, rdn_batch).cpu()   # (B, C, tile_size*scale, tile_size*scale)
 
-            done += 1
-            logging.debug(f'  Tile {done}/{total}: LR[{y}:{y_end}, {x}:{x_end}]')
+        # Distribute each tile result back into the accumulation buffers
+        for j, tile_info in enumerate(batch):
+            th, tw = tile_info['th'], tile_info['tw']
+            oy, ox = tile_info['oy'], tile_info['ox']
+            kh, kw = th * scale, tw * scale
 
-    # ---- Normalise and clamp ----
-    output = output_sum / weight_sum.clamp(min=1e-8)
-    output = output.clamp(0.0, 1.0)
+            # Remove padding from SR output
+            out_tile = out_batch[j:j+1, :, :kh, :kw]
+
+            # Blending kernel (crop to actual size for border tiles)
+            k = torch.from_numpy(
+                kernel_np if (kh == tile_out and kw == tile_out)
+                else kernel_np[:kh, :kw]
+            ).unsqueeze(0).unsqueeze(0)
+
+            output_sum[:, :, oy:oy+kh, ox:ox+kw] += out_tile * k
+            weight_sum[:, :, oy:oy+kh, ox:ox+kw] += k
+
+        del lr_batch, ref_batch, rdn_batch, out_batch
+        gc.collect()
+
+        done = min(batch_start + tile_batch_size, total)
+        logging.debug(f'  Processed {done}/{total} tiles')
+
+    # -------------------------------------------------------------------------
+    # Step 4: Normalise and clamp
+    # -------------------------------------------------------------------------
+    output = (output_sum / weight_sum.clamp(min=1e-8)).clamp(0.0, 1.0)
     return output
 
 
@@ -219,7 +242,7 @@ def load_model(cfg: dict, device: torch.device):
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}\n"
-            f"Please set test_setup.checkpoint in config.yml."
+            f"Please set test_setup.checkpoint in configs/test_tiled.yml."
         )
     logging.info(f'Loading checkpoint: {ckpt_path}')
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -250,19 +273,19 @@ def main():
         datefmt='%H:%M:%S',
     )
 
-    with open(args.config) as f:
+    with open(args.config, encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
     setup  = cfg['test_setup']
     paths  = cfg['paths']
     device = torch.device(setup['device'])
-    scale      = setup['scale']
-    tile_size  = setup['tile_size']
-    overlap    = setup['overlap']
-    blending   = setup.get('blending', 'gaussian')
+    scale           = setup['scale']
+    tile_size       = setup['tile_size']
+    overlap         = setup['overlap']
+    blending        = setup.get('blending', 'gaussian')
+    tile_batch_size = setup.get('tile_batch_size', 1)
 
     net = load_model(cfg, device)
-
     os.makedirs(paths['save_dir'], exist_ok=True)
 
     dataset = InferenceDataset(
@@ -275,35 +298,34 @@ def main():
     for idx in range(len(dataset)):
         sample = dataset[idx]
         name   = sample['name']
-        lr     = sample['LR'].unsqueeze(0)        # (1, C, H, W)
-        ref    = sample['Ref'].unsqueeze(0)       # (1, C, H*4, W*4)
-        ref_dn = sample['Ref_down'].unsqueeze(0)  # (1, C, H, W)
+        lr     = sample['LR'].unsqueeze(0)
+        ref    = sample['Ref'].unsqueeze(0)
+        ref_dn = sample['Ref_down'].unsqueeze(0)
 
         h_lr, w_lr = lr.shape[2], lr.shape[3]
         logging.info(
-            f'[{idx+1}/{len(dataset)}] {name}  '
-            f'LR={w_lr}x{h_lr}  '
-            f'tile={tile_size} overlap={overlap} blend={blending}'
+            f'[{idx+1}/{len(dataset)}] {name}  LR={w_lr}x{h_lr}  '
+            f'tile={tile_size} overlap={overlap} batch={tile_batch_size} blend={blending}'
         )
 
         output = run_tiled_inference(
-            net            = net,
-            lr_tensor      = lr,
-            ref_tensor     = ref,
-            ref_down_tensor= ref_dn,
-            tile_size      = tile_size,
-            overlap        = overlap,
-            scale          = scale,
-            blending       = blending,
-            device         = device,
+            net             = net,
+            lr_tensor       = lr,
+            ref_tensor      = ref,
+            ref_down_tensor = ref_dn,
+            tile_size       = tile_size,
+            overlap         = overlap,
+            scale           = scale,
+            blending        = blending,
+            device          = device,
+            tile_batch_size = tile_batch_size,
         )
 
-        # Save as PNG (BGR, uint8)
         out_np = (output[0].permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
         stem, _ = os.path.splitext(name)
         out_path = os.path.join(paths['save_dir'], f'{stem}_sr.png')
         cv2.imwrite(out_path, out_np)
-        logging.info(f'  Saved → {out_path}')
+        logging.info(f'  Saved -> {out_path}')
 
         del lr, ref, ref_dn, output
         gc.collect()

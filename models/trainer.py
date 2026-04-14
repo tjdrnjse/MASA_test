@@ -7,7 +7,10 @@ import numpy as np
 import random
 from PIL import Image
 import importlib
-from tensorboardX import SummaryWriter
+try:
+    from tensorboardX import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel

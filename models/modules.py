@@ -11,7 +11,6 @@ import functools
 from functools import partial
 import sys
 sys.path.append('..')
-import models
 from utils.util import scandir
 
 # automatically scan and import arch modules
