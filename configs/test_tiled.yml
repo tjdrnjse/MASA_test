@@ -1,6 +1,6 @@
 test_setup:
   checkpoint: "pretrained/masa_rec.pth"
-  tile_size: 128       # LR 좌표 기준 타일 크기 (32의 배수 권장, 저사양 환경: 64~128)
+  tile_size: 128       # LR 좌표 기준 타일 크기 (8의 배수, 저사양 환경: 64~128)
   overlap: 16          # 타일 간 겹침 크기 (artifact 최소화)
   scale: 4             # SR 배율 (MASA 학습 기준 1:4)
   blending: "gaussian" # 블렌딩 방식: "gaussian" | "linear"

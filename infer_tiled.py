@@ -64,7 +64,9 @@ def _linear_kernel(size: int) -> np.ndarray:
 
 def _pad_to_size(tensor: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
     """Replicate-pad tensor to exactly (target_h, target_w).
-    Used to make border tiles the same shape as interior tiles for batching.
+    Only does real work when the image is smaller than tile_size itself.
+    For normal images (H >= tile_size), _tile_starts ensures every tile is
+    already exactly tile_size, so this is a no-op.
     """
     _, _, h, w = tensor.shape
     pad_b = target_h - h
@@ -102,7 +104,10 @@ def run_tiled_inference(
         lr_tensor       : (1, C, H, W)            LR image on CPU.
         ref_tensor      : (1, C, H*scale, W*scale) Ref pre-scaled to 4x LR.
         ref_down_tensor : (1, C, H, W)            Ref downsampled to LR size.
-        tile_size       : Tile edge in LR pixels (must be a multiple of 32).
+        tile_size       : Tile edge in LR pixels (must be a multiple of 8,
+                          the model's internal block size). Image dimensions
+                          do NOT need to be multiples of tile_size — the last
+                          tile automatically overlaps more to stay tile_size.
         overlap         : Overlap between adjacent tiles in LR pixels.
         scale           : SR upscale factor.
         blending        : 'gaussian' | 'linear'.
@@ -112,8 +117,12 @@ def run_tiled_inference(
     Returns:
         (1, C, H*scale, W*scale) SR tensor on CPU, values in [0, 1].
     """
-    if tile_size % 32 != 0:
-        raise ValueError(f"tile_size ({tile_size}) must be a multiple of 32.")
+    # MASA internally divides the input into 8x8 LR blocks (lr_block_size=8),
+    # so tile_size must be divisible by 8. No constraint on image dimensions —
+    # _tile_starts ensures the last tile shifts left/up to always be tile_size,
+    # giving it a larger overlap instead of a truncated size.
+    if tile_size % 8 != 0:
+        raise ValueError(f"tile_size ({tile_size}) must be a multiple of 8 (MASA lr_block_size).")
     stride = tile_size - overlap
     if stride <= 0:
         raise ValueError(f"overlap ({overlap}) must be smaller than tile_size ({tile_size}).")
