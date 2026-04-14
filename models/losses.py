@@ -392,7 +392,7 @@ def gradient_penalty_loss(discriminator, real_data, fake_data, weight=None):
 
     # interpolate between real_data and fake_data
     interpolates = alpha * real_data + (1. - alpha) * fake_data
-    interpolates = autograd.Variable(interpolates, requires_grad=True)
+    interpolates = interpolates.detach().requires_grad_(True)
 
     disc_interpolates = discriminator(interpolates)
     gradients = autograd.grad(

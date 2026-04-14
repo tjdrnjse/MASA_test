@@ -11,7 +11,6 @@ from tensorboardX import SummaryWriter
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.autograd import Variable
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torchvision
 import torch.nn.functional as F
@@ -129,7 +128,7 @@ class Trainer(object):
     def prepare(self, batch_samples):
         for key in batch_samples.keys():
             if 'name' not in key and 'pad_nums' not in key:
-                batch_samples[key] = Variable(batch_samples[key].to(self.device), requires_grad=False)
+                batch_samples[key] = batch_samples[key].to(self.device)
 
         if self.args.phase == 'train':
             if self.augmentation:
@@ -173,7 +172,6 @@ class Trainer(object):
         self.best_psnr = 0
         self.augmentation = False  # disenable data augmentation to warm up the encoder
         for i in range(self.args.start_iter, self.args.max_iter):
-            self.scheduler.step()
             logging.info('current_lr: %f' % (self.optimizer_G.param_groups[0]['lr']))
             t0 = time.time()
             for j, batch_samples in enumerate(self.train_dataloader):
@@ -220,6 +218,7 @@ class Trainer(object):
                 log_info += 'loss_sum:%f ' % (loss.item())
                 loss.backward()
                 self.optimizer_G.step()
+                self.scheduler.step()
 
                 ## print information
                 if j % self.args.log_freq == 0:
@@ -232,7 +231,7 @@ class Trainer(object):
 
                 ## visualization
                 if j % self.args.vis_freq == 0:
-                    LR_sr = F.interpolate(batch_samples['LR'], scale_factor=self.args.sr_scale, mode='bicubic')
+                    LR_sr = F.interpolate(batch_samples['LR'], scale_factor=self.args.sr_scale, mode='bicubic', align_corners=False)
                     vis_temps = [LR_sr, batch_samples['HR'], batch_samples['Ref'], output]
                     self.vis_results(i, j, vis_temps)
 
@@ -407,7 +406,7 @@ class Trainer(object):
         network = getattr(self, net_name)
         if isinstance(network, nn.DataParallel) or isinstance(network, DistributedDataParallel):
             network = network.module
-        load_net = torch.load(load_path, map_location=torch.device(self.device))
+        load_net = torch.load(load_path, map_location=torch.device(self.device), weights_only=False)
         load_net_clean = OrderedDict()  # remove unnecessary 'module.'
         for k, v in load_net.items():
             if k.startswith('module.'):

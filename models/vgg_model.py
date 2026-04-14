@@ -103,7 +103,19 @@ class VGGFeatureExtractor(nn.Module):
         # vgg19.load_state_dict(state_dict)
         # features = vgg19.features[:max_idx + 1]
 
-        features = getattr(vgg, vgg_type)(pretrained=True).features[:max_idx + 1]
+        # Torchvision 0.13+ weights API (replaces deprecated pretrained=True)
+        _weights_map = {
+            'vgg11': 'VGG11_Weights', 'vgg11_bn': 'VGG11_BN_Weights',
+            'vgg13': 'VGG13_Weights', 'vgg13_bn': 'VGG13_BN_Weights',
+            'vgg16': 'VGG16_Weights', 'vgg16_bn': 'VGG16_BN_Weights',
+            'vgg19': 'VGG19_Weights', 'vgg19_bn': 'VGG19_BN_Weights',
+        }
+        _weights_cls = _weights_map.get(vgg_type, None)
+        if _weights_cls and hasattr(vgg, _weights_cls):
+            _weights = getattr(vgg, _weights_cls).DEFAULT
+            features = getattr(vgg, vgg_type)(weights=_weights).features[:max_idx + 1]
+        else:
+            features = getattr(vgg, vgg_type)(pretrained=True).features[:max_idx + 1]
 
         modified_net = OrderedDict()
         for k, v in zip(self.names, features):

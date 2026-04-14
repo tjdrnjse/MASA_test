@@ -1,0 +1,19 @@
+test_setup:
+  checkpoint: "pretrained/masa_rec.pth"
+  tile_size: 128       # LR 좌표 기준 타일 크기 (32의 배수 권장, 저사양 환경: 64~128)
+  overlap: 16          # 타일 간 겹침 크기 (artifact 최소화)
+  scale: 4             # SR 배율 (MASA 학습 기준 1:4)
+  blending: "gaussian" # 블렌딩 방식: "gaussian" | "linear"
+  device: "cpu"        # 내장 GPU / CPU 테스트: "cpu" | "cuda"
+
+paths:
+  lr_dir: "./test/input"
+  ref_dir: "./test/ref"
+  save_dir: "./results/tiled_sr"
+
+model:
+  net_name: "MASA"
+  input_nc: 3
+  nf: 64
+  num_nbr: 1
+  sr_scale: 4

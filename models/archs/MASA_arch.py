@@ -327,7 +327,7 @@ class MASA(nn.Module):
         _, Hi, Wi = index.size()
         out_fold = F.fold(out_unfold, output_size=(Hi*scale, Wi*scale), kernel_size=(ks, ks), padding=pd, stride=stride)
         divisor = F.fold(divisor, output_size=(Hi*scale, Wi*scale), kernel_size=(ks, ks), padding=pd, stride=stride)
-        soft_att_resize = F.interpolate(soft_att, size=(Hi*scale, Wi*scale), mode='bilinear')
+        soft_att_resize = F.interpolate(soft_att, size=(Hi*scale, Wi*scale), mode='bilinear', align_corners=False)
         out_fold = out_fold / divisor * soft_att_resize
         # out_fold = out_fold / (ks*ks) * soft_att_resize
         return out_fold
@@ -343,7 +343,7 @@ class MASA(nn.Module):
         ind_y_l = []
         ind_x_l = []
         for i in range(idx_x1.size(0)):
-            grid_y, grid_x = torch.meshgrid(idx_y1[i], idx_x1[i])
+            grid_y, grid_x = torch.meshgrid(idx_y1[i], idx_x1[i], indexing='ij')
             ind_y_l.append(grid_y.contiguous().view(-1))
             ind_x_l.append(grid_x.contiguous().view(-1))
         ind_y = torch.cat(ind_y_l)
@@ -361,7 +361,7 @@ class MASA(nn.Module):
         diameter_x = 2 * int(w // (2 * px) * self.ref_down_block_size) + 1
         diameter_y = 2 * int(h // (2 * py) * self.ref_down_block_size) + 1
 
-        lrsr = F.interpolate(lr, scale_factor=self.scale, mode='bicubic')
+        lrsr = F.interpolate(lr, scale_factor=self.scale, mode='bicubic', align_corners=False)
 
         fea_lr_l = self.enc(lr)
         fea_reflr_l = self.enc(ref_down)
