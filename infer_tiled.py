@@ -240,8 +240,8 @@ def load_model(cfg: dict, device: torch.device):
 
 def main():
     parser = argparse.ArgumentParser(description='MASA-SR Tiled Inference')
-    parser.add_argument('--config', default='config.yml',
-                        help='Path to YAML config (default: config.yml)')
+    parser.add_argument('--config', default='configs/test_tiled.yml',
+                        help='Path to YAML config (default: configs/test_tiled.yml)')
     args = parser.parse_args()
 
     logging.basicConfig(
